@@ -1,0 +1,117 @@
+# Kite - emotion analysis backend
+
+from arduino.app_utils import *
+from arduino.app_bricks.web_ui import WebUI
+from arduino.app_bricks.video_imageclassification import VideoImageClassification
+from datetime import datetime, UTC
+import time
+import urllib.request
+import urllib.parse
+
+# ---- Config ----
+DISTRESS_EMOTIONS = {"anger", "fear"}
+ALERT_CONFIDENCE = 0.6
+DISTRESS_HOLD_SEC = 2.0
+ALERT_COOLDOWN_SEC = 15.0
+
+# ---- Telegram ----
+TELEGRAM_TOKEN = "telgram token change it to your telegram token"
+TELEGRAM_CHAT_ID = "xxxxxxxxxx"
+
+# ---- LED colors (0-255) ----
+RED = (255, 0, 0)      # distress
+GREEN = (0, 255, 0)    # joy
+BLUE = (0, 0, 255)     # everything else
+
+ui = WebUI()
+classifier = VideoImageClassification(confidence=0.5, debounce_sec=0.0)
+
+# ---- State ----
+distress_since = None
+last_alert_time = 0.0
+
+ui.on_message("override_th", lambda sid, threshold: classifier.override_threshold(threshold))
+
+
+def set_emotion_led(emotion):
+    if emotion in DISTRESS_EMOTIONS:
+        r, g, b = RED
+    elif emotion == "joy":
+        r, g, b = GREEN
+    else:
+        r, g, b = BLUE
+    try:
+        Bridge.call("set_led3_color", r, g, b)
+    except Exception as e:
+        print("[LED] error:", e)
+
+
+def notify_mcu(event):
+    if event == "distress":
+        try:
+            Bridge.call("distress_sound")
+        except Exception as e:
+            print("[MCU] error:", e)
+
+
+def notify_caregiver(emotion, confidence):
+    text = f"Kite alert: {emotion} detected ({int(confidence * 100)}%). Please check in."
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        data = urllib.parse.urlencode({
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+        }).encode()
+        urllib.request.urlopen(url, data=data, timeout=5)
+        print("[TELEGRAM] sent")
+    except Exception as e:
+        print("[TELEGRAM] error:", e)
+
+
+def raise_alert(emotion, confidence):
+    ui.send_message("alert", message={
+        "emotion": emotion,
+        "confidence": confidence,
+        "timestamp": datetime.now(UTC).isoformat(),
+    })
+    notify_mcu("distress")
+    notify_caregiver(emotion, confidence)
+
+
+def handle_frame(classifications):
+    global distress_since, last_alert_time
+
+    # classifications is {"label": confidence, ...}
+    top_emotion = None
+    top_conf = 0.0
+    for label, confidence in classifications.items():
+        if confidence > top_conf:
+            top_conf = confidence
+            top_emotion = label
+
+    if top_emotion is None:
+        return
+
+    ui.send_message("emotion", message={
+        "emotion": top_emotion,
+        "confidence": top_conf,
+        "timestamp": datetime.now(UTC).isoformat(),
+    })
+
+    set_emotion_led(top_emotion)
+
+    now = time.monotonic()
+    is_distress = top_emotion in DISTRESS_EMOTIONS and top_conf >= ALERT_CONFIDENCE
+    if is_distress:
+        if distress_since is None:
+            distress_since = now
+        if now - distress_since >= DISTRESS_HOLD_SEC and now - last_alert_time >= ALERT_COOLDOWN_SEC:
+            last_alert_time = now
+            raise_alert(top_emotion, top_conf)
+    else:
+        distress_since = None
+
+
+classifier.on_detect_all(handle_frame)
+
+App.run()
